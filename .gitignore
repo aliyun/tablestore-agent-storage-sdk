@@ -28,3 +28,10 @@ lib-cov
 *.log
 __pycache__/
 /python/agent-storage-sdk/
+.worktrees/
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Java SDK is not ready yet; keep it out of the repo for now.
+/java/

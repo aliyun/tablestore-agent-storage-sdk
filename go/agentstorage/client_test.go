@@ -3,6 +3,7 @@ package agentstorage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -112,6 +113,37 @@ func TestUploadDocumentsFileNotFound(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "File not found") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestUploadDocumentsPreservesUploaderErrorClassification(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "file.pdf")
+	if err := os.WriteFile(filePath, []byte("pdf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cause := errors.New("upload failure marker")
+	client := newUploadTestClient(t, &fakeUploader{putErr: cause}, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("no request expected")
+	})
+	_, err := client.UploadDocuments(context.Background(), &UploadDocumentsRequest{
+		KnowledgeBaseName: "kb",
+		Documents:         []UploadDocumentItem{{FilePath: filePath}},
+	})
+
+	var clientErr *ClientError
+	if !errors.As(err, &clientErr) {
+		t.Fatalf("error type = %T, want *ClientError", err)
+	}
+	if got, want := clientErr.Kind(), ClientErrorKindTransportOther; got != want {
+		t.Errorf("ClientError.Kind() = %q, want %q", got, want)
+	}
+	if !errors.Is(err, cause) {
+		t.Error("uploader cause was not preserved")
+	}
+	if got, want := clientErr.Error(), "OTSClientError: Failed to upload file to OSS: upload failure marker"; got != want {
+		t.Errorf("ClientError.Error() = %q, want %q", got, want)
 	}
 }
 

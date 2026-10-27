@@ -68,7 +68,7 @@ type Config struct {
 const defaultTimeout = 30 * time.Second
 
 // Client is the Tablestore Agent Storage client, covering the knowledge-base,
-// document, chunk, retrieval and memory APIs of the Python/TypeScript SDKs.
+// document, chunk, retrieval, memory, file and Wiki APIs.
 type Client struct {
 	ots          *otsJSONClient
 	instanceName string
@@ -190,7 +190,7 @@ func (c *Client) Do(ctx context.Context, action string, payload any, result any)
 		return nil
 	}
 	if err := json.Unmarshal(body, result); err != nil {
-		return newClientError("failed to parse JSON response: %v", err)
+		return newClientErrorWithCause(ClientErrorKindResponseDecode, err, "failed to parse JSON response: %v", err)
 	}
 	return nil
 }
@@ -345,7 +345,7 @@ func (c *Client) UploadDocuments(ctx context.Context, req *UploadDocumentsReques
 		}
 		objectKey := buildOssObjectKey(c.instanceName, req.KnowledgeBaseName, req.Subspace, document.FilePath)
 		if err := c.uploader.PutObjectFromFile(ctx, objectKey, document.FilePath); err != nil {
-			return nil, newClientError("Failed to upload file to OSS: %v", err)
+			return nil, newClientErrorWithCause(classifyTransportError(err), err, "Failed to upload file to OSS: %v", err)
 		}
 		uploadedKeys = append(uploadedKeys, objectKey)
 		documents = append(documents, AddDocumentItem{
@@ -518,7 +518,9 @@ func (c *Client) ApplyMemoryDreamActions(ctx context.Context, req *ApplyMemoryDr
 // Item APIs (file-memory stores)
 // ---------------------------------------------------------------------------
 
-// AddItem creates a new item in a file-memory store.
+// AddItem creates a new item in a file-memory store. SessionID is recorded
+// as the version's session actor; View selects whether the response echoes
+// content (ItemViewFull) or not (default ItemViewBasic).
 func (c *Client) AddItem(ctx context.Context, req *AddItemRequest) (*AddItemResponse, error) {
 	if req == nil {
 		req = &AddItemRequest{}
@@ -528,7 +530,9 @@ func (c *Client) AddItem(ctx context.Context, req *AddItemRequest) (*AddItemResp
 	return do[AddItemResponse](c, ctx, "AddItem", &r)
 }
 
-// ListItems lists items in a scope.
+// ListItems lists items in a scope; wildcard scopes following the
+// left-prefix rule are allowed. Depth 1 rolls deeper directories up into
+// entries typed ItemTypeMemoryFilePrefix.
 func (c *Client) ListItems(ctx context.Context, req *ListItemsRequest) (*ListItemsResponse, error) {
 	if req == nil {
 		req = &ListItemsRequest{}
@@ -538,8 +542,9 @@ func (c *Client) ListItems(ctx context.Context, req *ListItemsRequest) (*ListIte
 	return do[ListItemsResponse](c, ctx, "ListItems", &r)
 }
 
-// GetItem returns one item. Content is included unless IncludeContent is
-// explicitly false, which fetches metadata only.
+// GetItem returns one item addressed by exactly one of ItemID and Path.
+// Content is omitted unless View is ItemViewFull (the default ItemViewBasic
+// fetches metadata only).
 func (c *Client) GetItem(ctx context.Context, req *GetItemRequest) (*GetItemResponse, error) {
 	if req == nil {
 		req = &GetItemRequest{}
@@ -549,28 +554,83 @@ func (c *Client) GetItem(ctx context.Context, req *GetItemRequest) (*GetItemResp
 	return do[GetItemResponse](c, ctx, "GetItem", &r)
 }
 
-// UpdateItem rewrites an item's content (Content set) or moves it to a new
-// path (NewPath set); exactly one of the two must be provided.
+// UpdateItem atomically changes content and/or Path using ItemID and an
+// optional version Precondition. Legacy path addressing, NewPath and SHA
+// guards are translated to the current protocol without mutating req.
 func (c *Client) UpdateItem(ctx context.Context, req *UpdateItemRequest) (*UpdateItemResponse, error) {
 	if req == nil {
 		req = &UpdateItemRequest{}
 	}
 	r := *req
 	r.setDefaultType()
+	// Path is a rename destination in the current protocol. Only explicit
+	// deprecated fields opt into interpreting it as the legacy source address.
+	legacyPath := r.ItemID == "" && (r.NewPath != "" || r.ExpectedSHA256 != "")
+	if r.ItemID == "" && r.Path != nil && !legacyPath {
+		return nil, newClientErrorWithCause(ClientErrorKindRequestBuild, nil, "UpdateItem requires ItemID; legacy path addressing requires NewPath or ExpectedSHA256")
+	}
+	if r.ExpectedSHA256 != "" || legacyPath {
+		path := ""
+		if r.Path != nil {
+			path = *r.Path
+		}
+		// Guard reads need metadata only. A legacy no-op returns the read
+		// itself, so only that case needs the caller's requested response view.
+		legacyNoOp := r.ItemID == "" && r.Content == nil && r.ContentBase64 == nil && r.NewPath == ""
+		view := ItemViewBasic
+		if legacyNoOp {
+			view = r.View
+		}
+		item, err := c.resolveItemGuard(ctx, r.ItemScopedRequest, r.ItemID, path, r.ExpectedSHA256, r.Precondition, view)
+		if err != nil {
+			return nil, err
+		}
+		if r.ItemID == "" {
+			r.ItemID, r.Path = item.ItemID, nil
+			// Preserve legacy path-based no-op requests as a read.
+			if legacyNoOp {
+				return item, nil
+			}
+		}
+		if r.ExpectedSHA256 != "" {
+			r.Precondition = &ItemPrecondition{ExpectedVersionID: item.LatestVersionID}
+			r.ExpectedSHA256 = ""
+		}
+	}
 	return do[UpdateItemResponse](c, ctx, "UpdateItem", &r)
 }
 
-// DeleteItem deletes an existing item.
+// DeleteItem deletes one item, or a whole wildcard scope asynchronously.
+//
+// Single delete: exact full scope plus exactly one of ItemID or Path;
+// synchronous, the response carries Deleted=true. Ranged delete:
+// wildcard scope without ItemID/Path/ExpectedSHA256, optional segment-
+// aligned PathPrefix; asynchronous, the service answers 200 and the
+// response carries TaskID with Status="pending".
 func (c *Client) DeleteItem(ctx context.Context, req *DeleteItemRequest) (*DeleteItemResponse, error) {
 	if req == nil {
 		req = &DeleteItemRequest{}
 	}
 	r := *req
 	r.setDefaultType()
+	if r.ExpectedSHA256 != "" {
+		if r.ItemID != "" && r.Path != "" {
+			return nil, newClientErrorWithCause(ClientErrorKindRequestBuild, nil, "DeleteItem requires exactly one of ItemID or Path")
+		}
+		item, err := c.resolveItemGuard(ctx, r.ItemScopedRequest, r.ItemID, r.Path, r.ExpectedSHA256, r.Precondition, ItemViewBasic)
+		if err != nil {
+			return nil, err
+		}
+		r.ItemID, r.Path = item.ItemID, ""
+		r.Precondition = &ItemPrecondition{ExpectedVersionID: item.LatestVersionID}
+		r.ExpectedSHA256 = ""
+	}
 	return do[DeleteItemResponse](c, ctx, "DeleteItem", &r)
 }
 
-// ListItemVersions lists immutable versions of one item.
+// ListItemVersions lists immutable versions in a scope, newest first. All
+// filters (ItemID/Path, SessionID, CreatedAtGte/Lte, Operation) are
+// optional; the scope may use the left-prefix wildcard.
 func (c *Client) ListItemVersions(ctx context.Context, req *ListItemVersionsRequest) (*ListItemVersionsResponse, error) {
 	if req == nil {
 		req = &ListItemVersionsRequest{}
@@ -580,8 +640,10 @@ func (c *Client) ListItemVersions(ctx context.Context, req *ListItemVersionsRequ
 	return do[ListItemVersionsResponse](c, ctx, "ListItemVersions", &r)
 }
 
-// GetItemVersion returns one immutable item version including its content;
-// redacted versions come back without content.
+// GetItemVersion returns one immutable item version identified by
+// VersionID, which is self-contained: the server derives all addressing
+// from it and verifies scope ownership. Content is omitted unless View is
+// ItemViewFull, and never returned for redacted versions.
 func (c *Client) GetItemVersion(ctx context.Context, req *GetItemVersionRequest) (*GetItemVersionResponse, error) {
 	if req == nil {
 		req = &GetItemVersionRequest{}
@@ -592,7 +654,8 @@ func (c *Client) GetItemVersion(ctx context.Context, req *GetItemVersionRequest)
 }
 
 // RedactItemVersion irreversibly clears the content, sha, size and path of
-// one item version, keeping the actor and timestamps. It is idempotent.
+// one item version identified by VersionID, keeping the actor and
+// timestamps. It is idempotent and first-wins.
 func (c *Client) RedactItemVersion(ctx context.Context, req *RedactItemVersionRequest) (*RedactItemVersionResponse, error) {
 	if req == nil {
 		req = &RedactItemVersionRequest{}
@@ -600,4 +663,34 @@ func (c *Client) RedactItemVersion(ctx context.Context, req *RedactItemVersionRe
 	r := *req
 	r.setDefaultType()
 	return do[RedactItemVersionResponse](c, ctx, "RedactItemVersion", &r)
+}
+
+// GetWiki returns Wiki metadata and the latest build state.
+func (c *Client) GetWiki(ctx context.Context, req *GetWikiRequest) (*GetWikiResponse, error) {
+	return do[GetWikiResponse](c, ctx, "GetWiki", req)
+}
+
+// UpdateWiki updates Wiki metadata and compile options.
+func (c *Client) UpdateWiki(ctx context.Context, req *UpdateWikiRequest) (*UpdateWikiResponse, error) {
+	return do[UpdateWikiResponse](c, ctx, "UpdateWiki", req)
+}
+
+// IngestWiki requests compilation of pending Wiki sources.
+func (c *Client) IngestWiki(ctx context.Context, req *IngestWikiRequest) (*IngestWikiResponse, error) {
+	return do[IngestWikiResponse](c, ctx, "IngestWiki", req)
+}
+
+// ListWikiPages lists published Wiki pages.
+func (c *Client) ListWikiPages(ctx context.Context, req *ListWikiPagesRequest) (*ListWikiPagesResponse, error) {
+	return do[ListWikiPagesResponse](c, ctx, "ListWikiPages", req)
+}
+
+// GetWikiPage returns one published Wiki page.
+func (c *Client) GetWikiPage(ctx context.Context, req *GetWikiPageRequest) (*GetWikiPageResponse, error) {
+	return do[GetWikiPageResponse](c, ctx, "GetWikiPage", req)
+}
+
+// SearchWikiPages searches published Wiki pages.
+func (c *Client) SearchWikiPages(ctx context.Context, req *SearchWikiPagesRequest) (*SearchWikiPagesResponse, error) {
+	return do[SearchWikiPagesResponse](c, ctx, "SearchWikiPages", req)
 }

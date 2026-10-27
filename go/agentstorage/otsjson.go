@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -49,7 +52,7 @@ func (c *otsJSONClient) request(ctx context.Context, action string, payload any)
 func (c *otsJSONClient) send(ctx context.Context, action string, payload any) (int, map[string]string, []byte, string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return 0, nil, nil, "", newClientError("failed to serialize request: %v", err)
+		return 0, nil, nil, "", newClientErrorWithCause(ClientErrorKindRequestSerialize, err, "failed to serialize request: %v", err)
 	}
 
 	var headers map[string]string
@@ -88,7 +91,7 @@ func (c *otsJSONClient) send(ctx context.Context, action string, payload any) (i
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+"/"+action, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, nil, "", newClientError("failed to build request: %v", err)
+		return 0, nil, nil, "", newClientErrorWithCause(ClientErrorKindRequestBuild, err, "failed to build request: %v", err)
 	}
 	for key, value := range headers {
 		req.Header.Set(key, value)
@@ -96,16 +99,65 @@ func (c *otsJSONClient) send(ctx context.Context, action string, payload any) (i
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, nil, nil, "", newClientError("failed to send request: %v", err)
+		return 0, nil, nil, "", newClientErrorWithCause(classifyTransportError(err), err, "failed to send request: %v", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, nil, nil, "", newClientError("failed to read response: %v", err)
+		return 0, nil, nil, "", newClientErrorWithCause(classifyResponseReadError(err), err, "failed to read response: %v", err)
 	}
 
 	return resp.StatusCode, normalizeHeaders(resp.Header), respBody, signDate, nil
+}
+
+func classifyResponseReadError(err error) ClientErrorKind {
+	if errors.Is(err, context.Canceled) {
+		return ClientErrorKindTransportContext
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ClientErrorKindTransportTimeout
+	}
+	var timeoutErr net.Error
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return ClientErrorKindTransportTimeout
+	}
+	return ClientErrorKindResponseRead
+}
+
+func classifyTransportError(err error) ClientErrorKind {
+	if errors.Is(err, context.Canceled) {
+		return ClientErrorKindTransportContext
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ClientErrorKindTransportTimeout
+	}
+	var timeoutErr net.Error
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return ClientErrorKindTransportTimeout
+	}
+
+	// http.Client.Do wraps every RoundTripper error in a *url.Error. Inspect
+	// the wrapped cause so a bare non-network error remains distinguishable
+	// from a URL or net error returned by the transport.
+	var outerURLError *url.Error
+	if errors.As(err, &outerURLError) {
+		var innerURLError *url.Error
+		if errors.As(outerURLError.Err, &innerURLError) {
+			return ClientErrorKindTransportNetwork
+		}
+		var innerNetError net.Error
+		if errors.As(outerURLError.Err, &innerNetError) {
+			return ClientErrorKindTransportNetwork
+		}
+		return ClientErrorKindTransportOther
+	}
+
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return ClientErrorKindTransportNetwork
+	}
+	return ClientErrorKindTransportOther
 }
 
 func normalizeHeaders(h http.Header) map[string]string {
@@ -145,37 +197,37 @@ func (c *otsJSONClient) validateResponse(headers map[string]string, body []byte,
 	if status >= 200 && status < 300 {
 		for _, header := range []string{"x-ots-contentmd5", "x-ots-requestid", "x-ots-date", "x-ots-contenttype"} {
 			if _, ok := headers[header]; !ok {
-				return newClientError("%q is missing in response header.", header)
+				return newClientErrorWithCause(ClientErrorKindResponseIntegrity, nil, "%q is missing in response header.", header)
 			}
 		}
 	}
 
 	if expected := headers["x-ots-contentmd5"]; expected != "" && md5Base64(body) != expected {
-		return newClientError("MD5 mismatch in response.")
+		return newClientErrorWithCause(ClientErrorKindResponseIntegrity, nil, "MD5 mismatch in response.")
 	}
 
 	authorization := headers["authorization"]
 	if authorization == "" {
 		if status >= 200 && status < 300 {
-			return newClientError("\"Authorization\" is missing in response header.")
+			return newClientErrorWithCause(ClientErrorKindResponseAuth, nil, "\"Authorization\" is missing in response header.")
 		}
 		return nil
 	}
 
 	if !strings.HasPrefix(authorization, "OTS ") {
-		return newClientError("Invalid Authorization in response.")
+		return newClientErrorWithCause(ClientErrorKindResponseAuth, nil, "Invalid Authorization in response.")
 	}
 	accessKeyID, signature, found := strings.Cut(authorization[4:], ":")
 	if !found || accessKeyID != c.accessKeyID {
-		return newClientError("Invalid access key id in response.")
+		return newClientErrorWithCause(ClientErrorKindResponseAuth, nil, "Invalid access key id in response.")
 	}
 
 	signingKey, err := c.signer.signingKey(c.accessKeySecret, signDate)
 	if err != nil {
-		return err
+		return newClientErrorWithCause(ClientErrorKindResponseAuth, err, "failed to derive response signing key: %v", err)
 	}
 	if signature != responseSignature(query, headers, signingKey) {
-		return newClientError("Invalid signature in response.")
+		return newClientErrorWithCause(ClientErrorKindResponseAuth, nil, "Invalid signature in response.")
 	}
 	return nil
 }

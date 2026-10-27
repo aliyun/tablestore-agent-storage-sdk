@@ -4,18 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tablestore-agent-storage"
-version = "1.0.5"
+version = "1.0.11"
 description = "A Python SDK for agent storage"
 readme = "README.md"
 requires-python = ">=3.8,<4.0"
 dependencies = [
     "oss2>=2.18.0",
-    "tablestore>=6.4.3",
+    "urllib3>=1.26,<3",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "tomli>=1.1.0; python_version < '3.11'",
     "black>=23.0.0",
     "flake8>=6.0.0",
 ]

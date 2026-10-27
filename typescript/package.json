@@ -1,0 +1,67 @@
+{
+  "name": "@tablestore/agent-storage",
+  "version": "0.0.13",
+  "description": "TypeScript SDK for Tablestore agent storage",
+  "keywords": [
+    "tablestore",
+    "agent",
+    "agent-storage",
+    "memory",
+    "knowledge-base",
+    "sdk"
+  ],
+  "homepage": "https://github.com/aliyun/tablestore-agent-storage-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/aliyun/tablestore-agent-storage-sdk/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aliyun/tablestore-agent-storage-sdk.git",
+    "directory": "typescript"
+  },
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js",
+      "require": "./dist/cjs/src/index.js",
+      "default": "./dist/src/index.js"
+    },
+    "./node": {
+      "types": "./dist/src/node.d.ts",
+      "import": "./dist/src/node.js",
+      "require": "./dist/cjs/src/node.js",
+      "default": "./dist/src/node.js"
+    }
+  },
+  "types": "./dist/src/index.d.ts",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node scripts/write-cjs-package-json.cjs",
+    "prepack": "npm run build",
+    "test": "vitest run",
+    "test:package:cjs": "npm run build && node tests/package-commonjs.cjs",
+    "test:package:contents": "node tests/package-contents.cjs",
+    "test:publish-script": "node tests/publish-script-auth.cjs",
+    "test:unit": "vitest run tests/unit",
+    "test:e2e": "vitest run tests/e2e"
+  },
+  "dependencies": {
+    "ali-oss": "^6.23.0"
+  },
+  "devDependencies": {
+    "@types/ali-oss": "^6.23.3",
+    "@types/node": "^24.7.2",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

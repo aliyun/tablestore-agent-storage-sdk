@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -30,52 +29,17 @@ var (
 	}
 )
 
-// v2Store returns the store to run against: an existing one named by
-// MEMORY_STORE_NAME, or a fresh store that is created, warmed up and deleted
-// again.
+// v2Store always creates an isolated store and verifies cleanup.
 func v2Store(t *testing.T, ctx context.Context, client *agentstorage.Client) string {
 	t.Helper()
-	if existing := strings.TrimSpace(os.Getenv("MEMORY_STORE_NAME")); existing != "" {
-		t.Logf("reusing store %s", existing)
-		waitForMemoryIDIndexReady(t, ctx, client, existing, fullScope("v2probe"))
-		return existing
-	}
-	store := fmt.Sprintf("gov2_%d_%s", time.Now().Unix(), suffix(6))
-	if _, err := client.CreateMemoryStore(ctx, &agentstorage.CreateMemoryStoreRequest{
-		MemoryStoreName: store,
-		Description:     "Go SDK memory v2 e2e",
-	}); err != nil {
-		t.Fatalf("CreateMemoryStore: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = client.DeleteMemoryStore(ctx, &agentstorage.DeleteMemoryStoreRequest{MemoryStoreName: store})
-	})
-	t.Log("warming up store (60s)...")
-	time.Sleep(60 * time.Second)
-	warmScope := fullScope("v2warm")
-	if _, err := retry(t, 5, 2*time.Second, func() (*agentstorage.AddMemoriesResponse, error) {
-		return client.AddMemories(ctx, &agentstorage.AddMemoriesRequest{
-			MemoryStoreName: store,
-			Scope:           &warmScope,
-			Text:            "Go SDK warm sentinel memory for store readiness.",
-			Sync:            true,
-		})
-	}, func(err error) bool {
-		status, _ := serviceStatus(err)
-		return status == 500
-	}); err != nil {
-		t.Fatalf("warm AddMemories: %v", err)
-	}
-	waitForListMatch(t, ctx, client, store, warmScope, "warm sentinel", "warm sentinel not list-visible")
-	waitForMemoryIDIndexReady(t, ctx, client, store, warmScope)
+	store := currentStore(t, client, agentstorage.StoreInputMessages, []string{agentstorage.StoreOutputStructured})
+	waitForMemoryIDIndexReady(t, ctx, client, store, fullScope("v2probe"))
 	return store
 }
 
 // TestMemoryV2SemanticAndTimeE2E covers the semantic description (title /
 // keywords) and the effective-time triple, including a manual UpdateMemory
-// override. Assertions on server-produced values only run when the service
-// actually returns them, so the test also passes against a service that has
-// the V2 write path switched off — it then reports what was skipped.
+// override. Missing semantic/time capability fails acceptance explicitly.
 func TestMemoryV2SemanticAndTimeE2E(t *testing.T) {
 	client := e2eClient(t)
 	ctx := context.Background()
@@ -115,7 +79,7 @@ func TestMemoryV2SemanticAndTimeE2E(t *testing.T) {
 
 	v2Active := target.TimeSource != "" || target.Title != "" || len(target.Keywords) > 0
 	if !v2Active {
-		t.Log("service returns no V2 fields (write switch off): skipping semantic/time assertions")
+		t.Fatal("service returns no V2 fields; semantic/time acceptance blocked")
 	} else {
 		if target.Title == "" {
 			t.Error("title is empty on a V2 unit")
@@ -151,7 +115,7 @@ func TestMemoryV2SemanticAndTimeE2E(t *testing.T) {
 	})
 	if err != nil {
 		if status, code := serviceStatus(err); status == 409 {
-			t.Logf("UpdateMemory with V2 fields rejected with 409 %s (write switch off): %v", code, err)
+			t.Fatalf("UpdateMemory with V2 fields rejected with 409 %s: %v", code, err)
 			return
 		}
 		t.Fatalf("UpdateMemory(v2 fields): %v", err)
@@ -284,7 +248,7 @@ func TestMemoryV2ContextScopeE2E(t *testing.T) {
 			hit.Unit.Scope.RunID, hit.Score, formatRanking(hit.RankingScore), hit.RankingSignals, hit.Unit.Text)
 	}
 	if !ranked {
-		t.Log("service returns no rankingScore (affinity mode off/shadow): request accepted, response unchanged")
+		t.Fatal("service returns no rankingScore; affinity-on acceptance blocked")
 		return
 	}
 

@@ -1,13 +1,17 @@
 """Agent Storage client implementation."""
 
+import logging
 import os
 from copy import deepcopy
 from typing import Dict, List, Optional, Tuple, Union
-import oss2
-import tablestore
-from tablestore import OTSServiceError
 
+import oss2
+
+from tablestore_agent_storage.errors import OTSServiceError
 from tablestore_agent_storage.models import (
+    DeleteItemRequest,
+    GetItemRequest,
+    UpdateItemRequest,
     CreateKnowledgeBaseRequest,
     DeleteKnowledgeBaseRequest,
     DescribeKnowledgeBaseRequest,
@@ -23,13 +27,29 @@ from tablestore_agent_storage.models import (
     ListChunksRequest,
     UpdateChunksRequest,
 )
+from tablestore_agent_storage.ots_json_client import OTSJSONClient
 
+
+logger = logging.getLogger(__name__)
 
 # Constants
 DEFAULT_SUBSPACE = "_default"
 OSS_PROTOCOL_PREFIX = "oss://"
 OSS_PATH_SEPARATOR = "/"
 SOURCE_DOC_FOLDER = "source_doc"
+
+# The item type accepted by the item APIs. The SDK fills it into any item
+# request whose "type" field is missing or empty.
+ITEM_TYPE_MEMORY_FILE = "memoryfile"
+
+# Directory-marker type emitted by ListItems when depth=1 rolls up deeper
+# subtrees. Prefix entries carry only "scope" and "path".
+ITEM_TYPE_MEMORY_FILE_PREFIX = "memoryfile_prefix"
+
+# Item payload view selector: "basic" (default) omits content; "full"
+# includes it.
+ITEM_VIEW_BASIC = "basic"
+ITEM_VIEW_FULL = "full"
 
 # Error messages
 ERROR_OSS_NOT_INITIALIZED = "OSS client not initialized. Please provide OSS configuration."
@@ -47,21 +67,36 @@ def _to_dict(request: Union[Dict, object]) -> Dict:
     return request
 
 
+def _to_item_request(request: Union[Dict, object]) -> Dict:
+    """Normalize an item request without mutating the caller's dict.
+
+    Returns a shallow copy with "type" filled with ITEM_TYPE_MEMORY_FILE when
+    the caller did not provide a non-empty value; explicit values pass
+    through unchanged.
+    """
+    body = {} if request is None else dict(_to_dict(request))
+    if not body.get("type"):
+        body["type"] = ITEM_TYPE_MEMORY_FILE
+    return body
+
+
 class AgentStorageClient:
     """Main storage client for OSS and OTS operations with knowledge base support."""
 
     def __init__(self, access_key_id=None, access_key_secret=None, sts_token=None, oss_endpoint=None,
-                 oss_bucket_name=None, ots_endpoint=None, ots_instance_name=None, **kwargs):
+                 oss_bucket_name=None, ots_endpoint=None, ots_instance_name=None, api_key=None, **kwargs):
         """
         Initialize storage client with unified credentials.
 
         Args:
             access_key_id: Aliyun access key ID (used for both OSS and OTS)
             access_key_secret: Aliyun access key secret (used for both OSS and OTS)
+            sts_token: STS token for temporary credentials
             oss_endpoint: OSS endpoint URL
             oss_bucket_name: OSS bucket name
             ots_endpoint: OTS endpoint URL
             ots_instance_name: OTS instance name
+            api_key: API key for OTS authentication (HTTPS only, does not apply to OSS)
         """
         self.access_key_id = access_key_id
         self.access_key_secret = access_key_secret
@@ -74,15 +109,20 @@ class AgentStorageClient:
         self.oss_client = None
         self.ots_client = None
 
-        if access_key_id and access_key_secret:
-            if oss_endpoint and oss_bucket_name:
-                self._init_oss()
-            if ots_endpoint and ots_instance_name:
-                self._init_ots(**kwargs)
-            else:
-                raise ValueError(ERROR_OTS_NOT_INITIALIZED)
-        else:
+        credentials_provider = kwargs.pop("credentials_provider", None)
+        has_static_credentials = bool(access_key_id and access_key_secret)
+        if not ots_endpoint or not ots_instance_name:
             raise ValueError(ERROR_OTS_NOT_INITIALIZED)
+        if not api_key and not has_static_credentials and credentials_provider is None:
+            raise ValueError(ERROR_OTS_NOT_INITIALIZED)
+
+        if has_static_credentials and oss_endpoint and oss_bucket_name:
+            self._init_oss()
+        self._init_ots(
+            api_key=api_key,
+            credentials_provider=credentials_provider,
+            **kwargs,
+        )
 
     def _init_oss(self):
         """Initialize OSS client."""
@@ -93,15 +133,23 @@ class AgentStorageClient:
             auth = oss2.StsAuth(self.access_key_id, self.access_key_secret, self.sts_token)
             self.oss_client = oss2.Bucket(auth, self.oss_endpoint, self.oss_bucket_name)
 
-    def _init_ots(self, **kwargs):
+    def _init_ots(self, api_key=None, credentials_provider=None, **kwargs):
         """Initialize OTS client."""
-        kwargs['sts_token'] = self.sts_token
-        self.ots_client = tablestore.OTSClient(
+        transport = kwargs.pop("_ots_transport", None)
+        clock = kwargs.pop("_clock", None)
+        sleep = kwargs.pop("_sleep", None)
+        self.ots_client = OTSJSONClient(
             self.ots_endpoint,
-            self.access_key_id,
-            self.access_key_secret,
             self.ots_instance_name,
-            **kwargs
+            access_key_id=self.access_key_id,
+            access_key_secret=self.access_key_secret,
+            sts_token=self.sts_token,
+            api_key=api_key,
+            credentials_provider=credentials_provider,
+            transport=transport,
+            clock=clock,
+            sleep=sleep,
+            **kwargs,
         )
 
     def _validate_oss_client(self):
@@ -240,7 +288,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.create_knowledge_base(_to_dict(request))
+        return self.ots_client.request("CreateKnowledgeBase", _to_dict(request))
 
     def delete_knowledge_base(self, request: Union[Dict, DeleteKnowledgeBaseRequest]):
         """
@@ -267,7 +315,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.delete_knowledge_base(_to_dict(request))
+        return self.ots_client.request("DeleteKnowledgeBase", _to_dict(request))
 
     def describe_knowledge_base(self, request: Union[Dict, DescribeKnowledgeBaseRequest]):
         """
@@ -302,7 +350,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.describe_knowledge_base(_to_dict(request))
+        return self.ots_client.request("DescribeKnowledgeBase", _to_dict(request))
 
     def list_knowledge_base(self, request: Union[Dict, ListKnowledgeBaseRequest] = None):
         """
@@ -341,7 +389,7 @@ class AgentStorageClient:
         """
         if request is None:
             request = {}
-        return self.ots_client.list_knowledge_base(_to_dict(request))
+        return self.ots_client.request("ListKnowledgeBase", _to_dict(request))
 
     def update_knowledge_base(self, request: Union[Dict, UpdateKnowledgeBaseRequest]):
         """
@@ -365,7 +413,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.update_knowledge_base(_to_dict(request))
+        return self.ots_client.request("UpdateKnowledgeBase", _to_dict(request))
 
     def add_documents(self, request: Union[Dict, AddDocumentsRequest]):
         """
@@ -411,7 +459,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.add_documents(_to_dict(request))
+        return self.ots_client.request("AddDocuments", _to_dict(request))
 
     def upload_documents(self, request: Union[Dict, UploadDocumentsRequest]):
         """
@@ -504,7 +552,7 @@ class AgentStorageClient:
 
         # Call the original add_documents method with modified request
         try:
-            add_documents_reps = self.ots_client.add_documents(modified_request)
+            add_documents_reps = self.ots_client.request("AddDocuments", modified_request)
             return add_documents_reps
         except OTSServiceError as e:
             if oss_keys:
@@ -534,7 +582,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.update_document(_to_dict(request))
+        return self.ots_client.request("UpdateDocument", _to_dict(request))
 
     def get_document(self, request: Union[Dict, GetDocumentRequest]):
         """
@@ -574,7 +622,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.get_document(_to_dict(request))
+        return self.ots_client.request("GetDocument", _to_dict(request))
 
     def list_documents(self, request: Union[Dict, ListDocumentsRequest]):
         """
@@ -613,7 +661,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.list_documents(_to_dict(request))
+        return self.ots_client.request("ListDocuments", _to_dict(request))
 
     def delete_documents(self, request: Union[Dict, DeleteDocumentsRequest], delete_file: bool = False):
         """
@@ -685,7 +733,7 @@ class AgentStorageClient:
             oss_keys_to_delete = self._collect_oss_keys_for_deletion(request_dict, kb_name, subspace)
 
         # Delete document metadata from OTS
-        delete_response = self.ots_client.delete_documents(request_dict)
+        delete_response = self.ots_client.request("DeleteDocuments", request_dict)
 
         # Delete actual files from OSS
         if delete_file and oss_keys_to_delete:
@@ -742,7 +790,7 @@ class AgentStorageClient:
         }
 
         try:
-            doc_infos = self.ots_client.get_document(get_request)
+            doc_infos = self.ots_client.request("GetDocument", get_request)
             if doc_infos.get("code") != "SUCCESS":
                 raise Exception(f"Failed to get document {doc_id}, response: {doc_infos}")
             
@@ -757,7 +805,7 @@ class AgentStorageClient:
 
         except Exception as e:
             # Log warning but continue with deletion
-            self.ots_client.logger.warning(f"Warning: Failed to get document {doc_id}: {e}")
+            logger.warning(f"Warning: Failed to get document {doc_id}: {e}")
             
         return None
 
@@ -779,10 +827,10 @@ class AgentStorageClient:
                 if bucket_name == self.oss_bucket_name:
                     keys_to_delete.append(object_key)
                 else:
-                    self.ots_client.logger.warning(
+                    logger.warning(
                         f"Warning: OSS key {oss_key} is from different bucket, skipping deletion")
             else:
-                self.ots_client.logger.warning(f"Warning: Invalid OSS key format: {oss_key}")
+                logger.warning(f"Warning: Invalid OSS key format: {oss_key}")
 
         # Batch delete objects
         if keys_to_delete:
@@ -790,7 +838,7 @@ class AgentStorageClient:
                 self.oss_client.batch_delete_objects(keys_to_delete)
             except Exception as e:
                 # Log error but don't fail the entire operation
-                self.ots_client.logger.warning(f"Warning: Failed to delete OSS objects {keys_to_delete}: {e}")
+                logger.warning(f"Warning: Failed to delete OSS objects {keys_to_delete}: {e}")
 
     def retrieve(self, request: Union[Dict, RetrieveRequest]):
         """
@@ -857,7 +905,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.retrieve(_to_dict(request))
+        return self.ots_client.request("Retrieve", _to_dict(request))
 
     def list_chunks(self, request: Union[Dict, ListChunksRequest]):
         """
@@ -905,7 +953,7 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.list_chunks(_to_dict(request))
+        return self.ots_client.request("ListChunks", _to_dict(request))
 
     def update_chunks(self, request: Union[Dict, UpdateChunksRequest]):
         """
@@ -951,4 +999,179 @@ class AgentStorageClient:
             OTSServiceError: If OTS request to server fails
             OTSClientError: If OTS request fails with client-side error
         """
-        return self.ots_client.update_chunks(_to_dict(request))
+        return self.ots_client.request("UpdateChunks", _to_dict(request))
+
+    # ---- Memory Store APIs ----
+
+    def create_memory_store(self, request: Dict):
+        return self.ots_client.request("CreateMemoryStore", _to_dict(request))
+
+    def get_memory_store(self, request: Dict):
+        return self.ots_client.request("GetMemoryStore", _to_dict(request))
+
+    def list_memory_stores(self, request: Dict = None):
+        if request is None:
+            request = {}
+        return self.ots_client.request("ListMemoryStores", _to_dict(request))
+
+    def update_memory_store(self, request: Dict):
+        return self.ots_client.request("UpdateMemoryStore", _to_dict(request))
+
+    def delete_memory_store(self, request: Dict):
+        return self.ots_client.request("DeleteMemoryStore", _to_dict(request))
+
+    # ---- Memory APIs ----
+
+    def add_memories(self, request: Dict):
+        return self.ots_client.request("AddMemories", _to_dict(request))
+
+    def search_memories(self, request: Dict):
+        return self.ots_client.request("SearchMemories", _to_dict(request))
+
+    def list_memories(self, request: Dict):
+        return self.ots_client.request("ListMemories", _to_dict(request))
+
+    def get_memory(self, request: Dict):
+        return self.ots_client.request("GetMemory", _to_dict(request))
+
+    def update_memory(self, request: Dict):
+        return self.ots_client.request("UpdateMemory", _to_dict(request))
+
+    def delete_memory(self, request: Dict):
+        return self.ots_client.request("DeleteMemory", _to_dict(request))
+
+    def list_memory_store_messages(self, request: Dict):
+        return self.ots_client.request("ListMemoryStoreMessages", _to_dict(request))
+
+    def list_memory_store_requests(self, request: Dict):
+        return self.ots_client.request("ListMemoryStoreRequests", _to_dict(request))
+
+    def get_memory_task(self, request: Dict):
+        return self.ots_client.request("GetMemoryTask", _to_dict(request))
+
+    def list_memory_tasks(self, request: Dict):
+        return self.ots_client.request("ListMemoryTasks", _to_dict(request))
+
+    def list_memory_store_scopes(self, request: Dict):
+        return self.ots_client.request("ListMemoryStoreScopes", _to_dict(request))
+
+    def create_memory_dream_task(self, request: Dict):
+        return self.ots_client.request("CreateMemoryDreamTask", _to_dict(request))
+
+    def get_memory_dream_task(self, request: Dict):
+        return self.ots_client.request("GetMemoryDreamTask", _to_dict(request))
+
+    def list_memory_dream_tasks(self, request: Dict):
+        return self.ots_client.request("ListMemoryDreamTasks", _to_dict(request))
+
+    def cancel_memory_dream_task(self, request: Dict):
+        return self.ots_client.request("CancelMemoryDreamTask", _to_dict(request))
+
+    def list_memory_dream_actions(self, request: Dict):
+        return self.ots_client.request("ListMemoryDreamActions", _to_dict(request))
+
+    def apply_memory_dream_actions(self, request: Dict):
+        return self.ots_client.request("ApplyMemoryDreamActions", _to_dict(request))
+
+    # ---- Item APIs (file-memory stores; standard JSON requests/responses) ----
+    # Every request carries "type": "memoryfile"; the SDK fills it when the
+    # caller omits it or passes an empty value.
+    #
+    # Scope rules: add_item, get_item, update_item, single delete_item,
+    # get_item_version and redact_item_version require all four scope
+    # segments exact (the version APIs derive ownership from the versionId
+    # and verify it against the exact scope); list_items, list_item_versions
+    # and ranged delete_item additionally accept the left-prefix "*" wildcard
+    # (appId and tenantId stay exact; once a segment is "*", every segment
+    # after it must be "*" too). Each scope field is capped at 128 bytes and
+    # must not contain "/" or NUL.
+
+    def add_item(self, request: Dict):
+        """Create a new item.
+
+        Request fields: path (required; must start with "/"), content
+        (required, may be an empty string), sessionId (optional, recorded as
+        the version's session actor), view ("basic"/"full", default "basic":
+        the response omits content unless "full").
+        """
+        return self.ots_client.request("AddItem", _to_item_request(request))
+
+    def list_items(self, request: Dict):
+        """List items in a scope (wildcard scopes allowed).
+
+        Request fields: pathPrefix (optional; must start and end with "/"),
+        depth (0 = recursive default, 1 = direct children with deeper
+        directories rolled up into "memoryfile_prefix" entries), view
+        ("basic"/"full"), limit (default 20, max 100, capped at 20 when
+        view="full"), nextToken (optional). Responses carry items typed
+        "memoryfile" or "memoryfile_prefix".
+        """
+        return self.ots_client.request("ListItems", _to_item_request(request))
+
+    def get_item(self, request: GetItemRequest):
+        """Get one item by itemId or path.
+
+        Exactly one of itemId and path is required; providing both is invalid.
+        view accepts "basic"/"full" and defaults to "basic" (metadata only);
+        pass view="full" to include content.
+        """
+        return self.ots_client.request("GetItem", _to_item_request(request))
+
+    def update_item(self, request: UpdateItemRequest):
+        """Update an item's content and/or rename it.
+
+        itemId is the only address and is required. At least one of content
+        (rewrite) and path (new target path) is required; both may be combined
+        in one atomic update. Optional fields: overwrite (clobber an occupied
+        target path), precondition.expectedVersionId (resource-version CAS),
+        sessionId, and view ("basic"/"full").
+        """
+        return self.ots_client.request("UpdateItem", _to_item_request(request))
+
+    def delete_item(self, request: DeleteItemRequest):
+        """Delete one item, or a whole wildcard scope asynchronously.
+
+        Single delete: exact full scope plus exactly one of itemId or path;
+        optional precondition.expectedVersionId and sessionId. Returns 200
+        with {"itemId", "deleted": true}.
+
+        Ranged delete: wildcard scope (left-prefix rule) without
+        itemId/path/precondition; optional segment-aligned pathPrefix
+        narrows the range. Returns 200 with {"taskId", "status": "pending"}
+        (the accept status moved from 202 to 200 because the OTS gateway
+        only forwards 200 responses).
+        """
+        return self.ots_client.request("DeleteItem", _to_item_request(request))
+
+    def list_item_versions(self, request: Dict):
+        """List immutable versions in a scope, newest first.
+
+        All filters optional: itemId, sessionId (mutually exclusive with
+        apiKeyId), apiKeyId (note: the service currently rejects a non-empty
+        apiKeyId with 400 - api-key actors are not wired into item mutations
+        yet; the field is kept for wire compatibility), createdAtGte/
+        createdAtLte (RFC3339), operation ("created"/"modified"/"deleted"),
+        view ("basic"/"full"), limit (default 20, max 100, capped at 20 when
+        view="full"), nextToken.
+        """
+        return self.ots_client.request("ListItemVersions", _to_item_request(request))
+
+    def get_item_version(self, request: Dict):
+        """Get one immutable item version.
+
+        Request fields: versionId (required; self-contained addressing -
+        the server verifies ownership against the exact four-part scope,
+        wildcards are rejected), view ("basic"/"full", default "basic").
+        Redacted versions never return content.
+        """
+        return self.ots_client.request("GetItemVersion", _to_item_request(request))
+
+    def redact_item_version(self, request: Dict):
+        """Irreversibly clear content, sha, size and path of one version.
+
+        Request fields: versionId (required; self-contained addressing -
+        the scope must be the exact four-part scope owning the version,
+        wildcards are rejected), sessionId (optional, recorded as the
+        session actor in redactedBy). Idempotent, first-wins.
+        """
+        return self.ots_client.request("RedactItemVersion", _to_item_request(request))

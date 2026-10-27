@@ -57,4 +57,3 @@ func (u *aliyunOSSUploader) DeleteObjects(_ context.Context, objectKeys []string
 	_, err = bucket.DeleteObjects(objectKeys, aliyunoss.DeleteObjectsQuiet(true))
 	return err
 }
-

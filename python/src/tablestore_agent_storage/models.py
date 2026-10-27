@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TypedDict, Union
 
 
 # ============================================================================
@@ -26,6 +26,69 @@ class _Unset:
 
 UNSET = _Unset()
 """Sentinel value indicating a field was not explicitly set by the user."""
+
+
+# ============================================================================
+# Item Request Models
+# ============================================================================
+
+class ItemScope(TypedDict):
+    """Exact or wildcard four-part scope used by the item APIs."""
+
+    appId: str
+    tenantId: str
+    agentId: str
+    runId: str
+
+
+class ItemPrecondition(TypedDict):
+    """Complete resource-version precondition for exact Update/Delete."""
+
+    expectedVersionId: str
+
+
+class _ItemScopedRequestRequired(TypedDict):
+    memoryStoreName: str
+    scope: ItemScope
+
+
+class ItemScopedRequest(_ItemScopedRequestRequired, total=False):
+    """Fields shared by item requests; the SDK fills the optional type."""
+
+    type: str
+
+
+class GetItemRequest(ItemScopedRequest, total=False):
+    """Get request; exactly one of itemId and path is required by the service."""
+
+    itemId: str
+    path: str
+    view: str
+
+
+class _UpdateItemRequestRequired(ItemScopedRequest):
+    itemId: str
+
+
+class UpdateItemRequest(_UpdateItemRequestRequired, total=False):
+    """Update request; content, target path, or both are required by the service."""
+
+    content: str
+    path: str
+    precondition: ItemPrecondition
+    overwrite: bool
+    sessionId: str
+    view: str
+
+
+class DeleteItemRequest(ItemScopedRequest, total=False):
+    """Exact single-item or wildcard ranged-delete request."""
+
+    itemId: str
+    path: str
+    pathPrefix: str
+    precondition: ItemPrecondition
+    sessionId: str
 
 
 # ============================================================================

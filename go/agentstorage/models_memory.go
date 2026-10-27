@@ -1,5 +1,7 @@
 package agentstorage
 
+import "encoding/json"
+
 // Scope identifies the four-level ownership of memory data. Depending on the
 // API, some levels are required, and list-style APIs accept the "*" wildcard.
 type Scope struct {
@@ -18,10 +20,8 @@ type MessagePayload struct {
 	Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
-// Timestamp is a request time bound. Pass an RFC3339 string where the API
-// documents RFC3339 (ListMemoryStoreMessages / ListMemoryStoreRequests) or a
-// Unix-millisecond integer where the API documents milliseconds (task and
-// dream APIs).
+// Timestamp is a request time bound: an RFC3339 string or a Unix-millisecond
+// integer. The server accepts both forms; nil omits a bound.
 type Timestamp = any
 
 // StorageModeOTS is the default storage mode of memory stores; see also
@@ -34,8 +34,12 @@ const StorageModeOTS = "ots"
 
 // CreateMemoryStoreRequest is the request for CreateMemoryStore.
 type CreateMemoryStoreRequest struct {
-	MemoryStoreName string `json:"memoryStoreName"`
-	Description     string `json:"description,omitempty"`
+	// InputType and OutputTypes replace StorageMode; do not combine both forms.
+	InputType             string   `json:"inputType,omitempty"`
+	OutputTypes           []string `json:"outputTypes,omitempty"`
+	WikiReflectionEnabled *bool    `json:"wikiReflectionEnabled,omitempty"`
+	MemoryStoreName       string   `json:"memoryStoreName"`
+	Description           string   `json:"description,omitempty"`
 	// ExtractInstructions injects custom memory-extraction guidance for this store.
 	ExtractInstructions string `json:"extractInstructions,omitempty"`
 	// StorageMode selects the immutable storage mode ("ots" default,
@@ -59,9 +63,11 @@ type ListMemoryStoresRequest struct {
 // semantics: nil fields stay unchanged, pointers to the empty string clear
 // the stored value.
 type UpdateMemoryStoreRequest struct {
-	MemoryStoreName     string  `json:"memoryStoreName"`
-	Description         *string `json:"description,omitempty"`
-	ExtractInstructions *string `json:"extractInstructions,omitempty"`
+	OutputTypes           []string `json:"outputTypes,omitempty"`
+	WikiReflectionEnabled *bool    `json:"wikiReflectionEnabled,omitempty"`
+	MemoryStoreName       string   `json:"memoryStoreName"`
+	Description           *string  `json:"description,omitempty"`
+	ExtractInstructions   *string  `json:"extractInstructions,omitempty"`
 }
 
 // DeleteMemoryStoreRequest is the request for DeleteMemoryStore.
@@ -71,19 +77,27 @@ type DeleteMemoryStoreRequest struct {
 
 // MemoryStoreInfo describes a memory store.
 type MemoryStoreInfo struct {
-	OTSInstance         string `json:"otsInstance,omitempty"`
-	MemoryStoreName     string `json:"memoryStoreName"`
-	Description         string `json:"description,omitempty"`
-	ExtractInstructions string `json:"extractInstructions,omitempty"`
-	StorageMode         string `json:"storageMode,omitempty"`
-	CreatedAt           string `json:"createdAt,omitempty"`
-	UpdatedAt           string `json:"updatedAt,omitempty"`
-	LastSeenAt          string `json:"lastSeenAt,omitempty"`
+	StoreUID              string   `json:"storeUid,omitempty"`
+	InputType             string   `json:"inputType,omitempty"`
+	OutputTypes           []string `json:"outputTypes,omitempty"`
+	WikiReflectionEnabled bool     `json:"wikiReflectionEnabled"`
+	OTSInstance           string   `json:"otsInstance,omitempty"`
+	MemoryStoreName       string   `json:"memoryStoreName"`
+	Description           string   `json:"description,omitempty"`
+	ExtractInstructions   string   `json:"extractInstructions,omitempty"`
+	StorageMode           string   `json:"storageMode,omitempty"`
+	CreatedAt             string   `json:"createdAt,omitempty"`
+	UpdatedAt             string   `json:"updatedAt,omitempty"`
+	LastSeenAt            string   `json:"lastSeenAt,omitempty"`
 }
 
 // MemoryStoreListItem is one entry of ListMemoryStores.
 type MemoryStoreListItem struct {
-	MemoryStoreName string `json:"memoryStoreName"`
+	StoreUID              string   `json:"storeUid,omitempty"`
+	InputType             string   `json:"inputType,omitempty"`
+	OutputTypes           []string `json:"outputTypes,omitempty"`
+	WikiReflectionEnabled bool     `json:"wikiReflectionEnabled"`
+	MemoryStoreName       string   `json:"memoryStoreName"`
 }
 
 type (
@@ -111,6 +125,7 @@ type DeleteMemoryStoreResponse struct {
 // AddMemoriesRequest is the request for AddMemories. Provide either Messages
 // or Text. Scope.AppID is required for writes; wildcards are not allowed.
 type AddMemoriesRequest struct {
+	Interaction     *InteractionRef   `json:"interaction,omitempty"`
 	MemoryStoreName string            `json:"memoryStoreName"`
 	Scope           *Scope            `json:"scope,omitempty"`
 	Messages        []MessagePayload  `json:"messages,omitempty"`
@@ -122,12 +137,16 @@ type AddMemoriesRequest struct {
 	ReferenceTime string `json:"referenceTime,omitempty"`
 }
 
-// SearchMemoriesRequest is the request for SearchMemories. Scope.AppID and
-// Scope.TenantID are required; AgentID/RunID accept the "*" wildcard.
+// SearchMemoriesRequest is the request for SearchMemories. Scope and Filter
+// select the conversations to search; explicit scope wildcards must be hierarchical.
 type SearchMemoriesRequest struct {
-	MemoryStoreName string `json:"memoryStoreName"`
-	Query           string `json:"query"`
-	Scope           *Scope `json:"scope,omitempty"`
+	Filter *ScopeFilter `json:"filter,omitempty"`
+	// Thresholds filters similarity and canonical score before session affinity.
+	// Do not combine with the legacy MinSimilarity field.
+	Thresholds      *SearchThresholds `json:"thresholds,omitempty"`
+	MemoryStoreName string            `json:"memoryStoreName"`
+	Query           string            `json:"query"`
+	Scope           *Scope            `json:"scope,omitempty"`
 	// ContextScope names the current session so its memories get a bounded
 	// soft boost while Scope stays cross-session (typically RunID: "*"). All
 	// four fields are required, wildcards are rejected, and it must be
@@ -144,14 +163,15 @@ type SearchMemoriesRequest struct {
 // ListMemoriesRequest is the request for ListMemories. The scope accepts
 // hierarchical "*" wildcards.
 type ListMemoriesRequest struct {
-	MemoryStoreName string `json:"memoryStoreName"`
-	Scope           *Scope `json:"scope,omitempty"`
-	Limit           int    `json:"limit,omitempty"`
-	NextToken       string `json:"nextToken,omitempty"`
+	Filter          *ScopeFilter `json:"filter,omitempty"`
+	MemoryStoreName string       `json:"memoryStoreName"`
+	Scope           *Scope       `json:"scope,omitempty"`
+	Limit           int          `json:"limit,omitempty"`
+	NextToken       string       `json:"nextToken,omitempty"`
 }
 
-// GetMemoryRequest is the request for GetMemory. Requires the full 4-field
-// scope without wildcards.
+// GetMemoryRequest is the request for GetMemory. Uses the full 4-field
+// scope without wildcards when supplied; zero Scope omits it for ID lookup.
 type GetMemoryRequest struct {
 	MemoryStoreName string `json:"memoryStoreName"`
 	MemoryID        string `json:"memoryId"`
@@ -161,11 +181,14 @@ type GetMemoryRequest struct {
 // UpdateMemoryRequest is the request for UpdateMemory. At least one of Text,
 // Metadata, Title, Keywords or the effective-time pair must be provided.
 type UpdateMemoryRequest struct {
-	MemoryStoreName string            `json:"memoryStoreName"`
-	MemoryID        string            `json:"memoryId"`
-	Scope           Scope             `json:"scope"`
-	Text            string            `json:"text,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
+	MemoryStoreName string `json:"memoryStoreName"`
+	MemoryID        string `json:"memoryId"`
+	Scope           Scope  `json:"scope"`
+	Text            string `json:"text,omitempty"`
+	// Metadata replaces stored metadata. nil leaves it unchanged; a non-nil
+	// empty map clears it. Before 0.0.3, empty maps were omitted; callers that
+	// intend to leave metadata unchanged must use nil.
+	Metadata map[string]string `json:"metadata,omitempty"`
 	// Title hand-corrects the server-extracted title (at most
 	// MaxMemoryTitleRunes characters). nil leaves it unchanged.
 	Title *string `json:"title,omitempty"`
@@ -307,11 +330,12 @@ type SearchHit struct {
 
 // AddMemoriesResponse is the response of AddMemories.
 type AddMemoriesResponse struct {
-	RequestID        string `json:"requestId,omitempty"`
-	Status           string `json:"status"`
-	AcceptedMessages int    `json:"acceptedMessages"`
-	Scope            *Scope `json:"scope,omitempty"`
-	MemoryStoreName  string `json:"memoryStoreName"`
+	MemoryIDs        []string `json:"memoryIds,omitempty"`
+	RequestID        string   `json:"requestId,omitempty"`
+	Status           string   `json:"status"`
+	AcceptedMessages int      `json:"acceptedMessages"`
+	Scope            *Scope   `json:"scope,omitempty"`
+	MemoryStoreName  string   `json:"memoryStoreName"`
 	// MemcellsCreated/UnitsCreated are only returned for sync writes.
 	MemcellsCreated int `json:"memcellsCreated,omitempty"`
 	UnitsCreated    int `json:"unitsCreated,omitempty"`
@@ -463,27 +487,34 @@ type ListMemoryTasksRequest struct {
 
 // ListMemoryStoreScopesRequest is the request for ListMemoryStoreScopes.
 type ListMemoryStoreScopesRequest struct {
-	MemoryStoreName string `json:"memoryStoreName"`
-	Scope           Scope  `json:"scope"`
-	Limit           int    `json:"limit,omitempty"`
-	NextToken       string `json:"nextToken,omitempty"`
+	Filter          *ScopeFilter `json:"filter,omitempty"`
+	MemoryStoreName string       `json:"memoryStoreName"`
+	Scope           Scope        `json:"scope"`
+	Limit           int          `json:"limit,omitempty"`
+	NextToken       string       `json:"nextToken,omitempty"`
 }
 
 // MemoryTask is the status record of one async ingestion request.
 type MemoryTask struct {
-	RequestID        string           `json:"requestId"`
-	EventType        string           `json:"eventType,omitempty"`
-	MemoryStoreName  string           `json:"memoryStoreName,omitempty"`
-	ConversationKey  string           `json:"conversationKey,omitempty"`
-	Scope            Scope            `json:"scope"`
-	Status           MemoryTaskStatus `json:"status"`
-	AcceptedMessages int              `json:"acceptedMessages,omitempty"`
-	DerivedMemcellID string           `json:"derivedMemcellId,omitempty"`
-	DerivedUnitIDs   []string         `json:"derivedUnitIds,omitempty"`
-	LastError        string           `json:"lastError,omitempty"`
-	CreatedAt        string           `json:"createdAt,omitempty"`
-	UpdatedAt        string           `json:"updatedAt,omitempty"`
-	FinishedAt       string           `json:"finishedAt,omitempty"`
+	PrimaryError           string           `json:"primaryError,omitempty"`
+	PrimaryErrorStage      string           `json:"primaryErrorStage,omitempty"`
+	PrimaryErrorClass      string           `json:"primaryErrorClass,omitempty"`
+	LastErrorStage         string           `json:"lastErrorStage,omitempty"`
+	LastErrorClass         string           `json:"lastErrorClass,omitempty"`
+	LastErrorInputRejected bool             `json:"lastErrorInputRejected,omitempty"`
+	RequestID              string           `json:"requestId"`
+	EventType              string           `json:"eventType,omitempty"`
+	MemoryStoreName        string           `json:"memoryStoreName,omitempty"`
+	ConversationKey        string           `json:"conversationKey,omitempty"`
+	Scope                  Scope            `json:"scope"`
+	Status                 MemoryTaskStatus `json:"status"`
+	AcceptedMessages       int              `json:"acceptedMessages,omitempty"`
+	DerivedMemcellID       string           `json:"derivedMemcellId,omitempty"`
+	DerivedUnitIDs         []string         `json:"derivedUnitIds,omitempty"`
+	LastError              string           `json:"lastError,omitempty"`
+	CreatedAt              string           `json:"createdAt,omitempty"`
+	UpdatedAt              string           `json:"updatedAt,omitempty"`
+	FinishedAt             string           `json:"finishedAt,omitempty"`
 }
 
 // GetMemoryTaskResponse is the response of GetMemoryTask.
@@ -502,10 +533,13 @@ type ListMemoryTasksResponse struct {
 
 // ListMemoryStoreScopesResponse is the response of ListMemoryStoreScopes.
 type ListMemoryStoreScopesResponse struct {
-	Scopes          []Scope `json:"scopes"`
-	Scope           Scope   `json:"scope"`
-	MemoryStoreName string  `json:"memoryStoreName"`
-	NextToken       string  `json:"nextToken,omitempty"`
+	// ScopeEntries retains heterogeneous directory fields (conversation/Wiki).
+	// Scopes remains the legacy four-field projection for existing callers.
+	ScopeEntries    []MemoryStoreScope `json:"-"`
+	Scopes          []Scope            `json:"scopes"`
+	Scope           Scope              `json:"scope"`
+	MemoryStoreName string             `json:"memoryStoreName"`
+	NextToken       string             `json:"nextToken,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +620,9 @@ const (
 // CreateMemoryDreamTaskRequest is the request for CreateMemoryDreamTask.
 // Timestamps are Unix milliseconds.
 type CreateMemoryDreamTaskRequest struct {
+	OutputScope          *Scope               `json:"outputScope,omitempty"`
+	MaxItems             int                  `json:"maxItems,omitempty"`
+	Effort               DreamEffort          `json:"effort,omitempty"`
 	MemoryStoreName      string               `json:"memoryStoreName"`
 	Scopes               []Scope              `json:"scopes"`
 	TaskType             DreamTaskType        `json:"taskType,omitempty"`
@@ -650,18 +687,24 @@ type ListMemoryDreamActionsRequest struct {
 
 // ApplyMemoryDreamActionsRequest is the request for ApplyMemoryDreamActions.
 type ApplyMemoryDreamActionsRequest struct {
+	Mode            string   `json:"mode,omitempty"`
+	Approver        string   `json:"approver,omitempty"`
 	MemoryStoreName string   `json:"memoryStoreName"`
 	DreamID         string   `json:"dreamId"`
-	ActionIDs       []string `json:"actionIds"`
+	ActionIDs       []string `json:"actionIds,omitempty"`
 	Applier         string   `json:"applier,omitempty"`
 }
 
 // DreamMemorySpec is the proposed memory content of an ADD/UPDATE/MERGE action.
 type DreamMemorySpec struct {
-	Text       string            `json:"text"`
-	SearchText string            `json:"searchText,omitempty"`
-	UnitType   string            `json:"unitType,omitempty"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
+	Title         string            `json:"title,omitempty"`
+	Keywords      []string          `json:"keywords,omitempty"`
+	EffectiveAt   string            `json:"effectiveAt,omitempty"`
+	TimePrecision string            `json:"timePrecision,omitempty"`
+	Text          string            `json:"text"`
+	SearchText    string            `json:"searchText,omitempty"`
+	UnitType      string            `json:"unitType,omitempty"`
+	Metadata      map[string]string `json:"metadata,omitempty"`
 }
 
 // DreamExtractSpec is the body of an extract produced by an EMIT_SKILL or
@@ -675,57 +718,76 @@ type DreamExtractSpec struct {
 
 // DreamActionRecord is one action produced by a dream task.
 type DreamActionRecord struct {
-	DreamID               string            `json:"dreamId"`
-	ActionID              string            `json:"actionId"`
-	MemoryStoreName       string            `json:"memoryStoreName,omitempty"`
-	Action                DreamActionType   `json:"action"`
-	Status                DreamActionStatus `json:"status"`
-	TargetScope           Scope             `json:"targetScope"`
-	SourceScopes          []Scope           `json:"sourceScopes,omitempty"`
-	TargetMemoryID        string            `json:"targetMemoryId,omitempty"`
-	TargetMemoryVersion   int               `json:"targetMemoryVersion,omitempty"`
-	TargetMemoryUpdatedAt int64             `json:"targetMemoryUpdatedAtMs,omitempty"`
-	NewMemory             *DreamMemorySpec  `json:"newMemory,omitempty"`
-	NewExtract            *DreamExtractSpec `json:"newExtract,omitempty"`
-	SourceMessageIDs      []string          `json:"sourceMessageIds,omitempty"`
-	SourceMemoryIDs       []string          `json:"sourceMemoryIds,omitempty"`
-	Reason                string            `json:"reason,omitempty"`
-	Confidence            float64           `json:"confidence,omitempty"`
-	ResultMemoryID        string            `json:"resultMemoryId,omitempty"`
-	ApplyStep             string            `json:"applyStep,omitempty"`
-	ApplyDetailJSON       string            `json:"applyDetailJson,omitempty"`
-	SkippedReason         string            `json:"skippedReason,omitempty"`
-	SkippedReasonDetail   string            `json:"skippedReasonDetail,omitempty"`
-	AppliedAt             string            `json:"appliedAt,omitempty"`
-	Applier               string            `json:"applier,omitempty"`
-	AttemptCount          int               `json:"attemptCount,omitempty"`
-	Error                 string            `json:"error,omitempty"`
-	CreatedAt             string            `json:"createdAt,omitempty"`
-	UpdatedAt             string            `json:"updatedAt,omitempty"`
+	ResultCorrectionID    string                   `json:"resultCorrectionId,omitempty"`
+	BatchID               string                   `json:"batchId,omitempty"`
+	BatchSequence         int                      `json:"batchSequence,omitempty"`
+	BatchActionIndex      int                      `json:"batchActionIndex,omitempty"`
+	ItemChange            *DreamItemChange         `json:"itemChange,omitempty"`
+	ResultItemID          string                   `json:"resultItemId,omitempty"`
+	ResultVersionID       string                   `json:"resultVersionId,omitempty"`
+	WikiCorrection        *DreamWikiCorrectionSpec `json:"wikiCorrection,omitempty"`
+	FrozenSourceRefs      []DreamFrozenSourceRef   `json:"frozenSourceRefs,omitempty"`
+	DreamID               string                   `json:"dreamId"`
+	ActionID              string                   `json:"actionId"`
+	MemoryStoreName       string                   `json:"memoryStoreName,omitempty"`
+	Action                DreamActionType          `json:"action"`
+	Status                DreamActionStatus        `json:"status"`
+	TargetScope           Scope                    `json:"targetScope"`
+	SourceScopes          []Scope                  `json:"sourceScopes,omitempty"`
+	TargetMemoryID        string                   `json:"targetMemoryId,omitempty"`
+	TargetMemoryVersion   int                      `json:"targetMemoryVersion,omitempty"`
+	TargetMemoryUpdatedAt int64                    `json:"targetMemoryUpdatedAtMs,omitempty"`
+	NewMemory             *DreamMemorySpec         `json:"newMemory,omitempty"`
+	NewExtract            *DreamExtractSpec        `json:"newExtract,omitempty"`
+	SourceMessageIDs      []string                 `json:"sourceMessageIds,omitempty"`
+	SourceMemoryIDs       []string                 `json:"sourceMemoryIds,omitempty"`
+	Reason                string                   `json:"reason,omitempty"`
+	Confidence            float64                  `json:"confidence,omitempty"`
+	ResultMemoryID        string                   `json:"resultMemoryId,omitempty"`
+	ApplyStep             string                   `json:"applyStep,omitempty"`
+	ApplyDetailJSON       string                   `json:"applyDetailJson,omitempty"`
+	SkippedReason         string                   `json:"skippedReason,omitempty"`
+	SkippedReasonDetail   string                   `json:"skippedReasonDetail,omitempty"`
+	AppliedAt             string                   `json:"appliedAt,omitempty"`
+	Applier               string                   `json:"applier,omitempty"`
+	AttemptCount          int                      `json:"attemptCount,omitempty"`
+	Error                 string                   `json:"error,omitempty"`
+	CreatedAt             string                   `json:"createdAt,omitempty"`
+	UpdatedAt             string                   `json:"updatedAt,omitempty"`
 }
 
 // DreamTask is one dream task as returned by ListMemoryDreamTasks.
 type DreamTask struct {
-	DreamID              string               `json:"dreamId"`
-	MemoryStoreName      string               `json:"memoryStoreName,omitempty"`
-	Status               DreamTaskStatus      `json:"status"`
-	TaskType             DreamTaskType        `json:"taskType,omitempty"`
-	ApplyMode            DreamApplyMode       `json:"applyMode,omitempty"`
-	ScopeOutputMode      DreamScopeOutputMode `json:"scopeOutputMode,omitempty"`
-	ClientToken          string               `json:"clientToken,omitempty"`
-	TriggerType          string               `json:"triggerType,omitempty"`
-	ExpandedScopeLimit   int                  `json:"expandedScopeLimit,omitempty"`
-	InputScopes          []Scope              `json:"inputScopes,omitempty"`
-	ExpandedScopes       []Scope              `json:"expandedScopes,omitempty"`
-	TargetScopes         []Scope              `json:"targetScopes,omitempty"`
-	MinTimestamp         int64                `json:"minTimestamp,omitempty"`
-	MaxTimestamp         int64                `json:"maxTimestamp,omitempty"`
-	MaxSessions          int                  `json:"maxSessions,omitempty"`
-	MaxMessages          int                  `json:"maxMessages,omitempty"`
-	MaxMemories          int                  `json:"maxMemories,omitempty"`
-	ConfidenceThresholds map[string]float64   `json:"confidenceThresholds,omitempty"`
-	Instructions         string               `json:"instructions,omitempty"`
-	Incremental          bool                 `json:"incremental,omitempty"`
+	Effort      DreamEffort      `json:"effort,omitempty"`
+	Stage       string           `json:"stage,omitempty"`
+	FailureCode string           `json:"failureCode,omitempty"`
+	OutputScope *Scope           `json:"outputScope,omitempty"`
+	MaxItems    int              `json:"maxItems,omitempty"`
+	Plan        *DreamPlan       `json:"plan,omitempty"`
+	Diagnostic  *DreamDiagnostic `json:"diagnostic,omitempty"`
+	// Current servers return nested Input/Actions in both Get and List.
+	Input                DreamTaskInputSummary `json:"input"`
+	Actions              DreamTaskActionStats  `json:"actions"`
+	DreamID              string                `json:"dreamId"`
+	MemoryStoreName      string                `json:"memoryStoreName,omitempty"`
+	Status               DreamTaskStatus       `json:"status"`
+	TaskType             DreamTaskType         `json:"taskType,omitempty"`
+	ApplyMode            DreamApplyMode        `json:"applyMode,omitempty"`
+	ScopeOutputMode      DreamScopeOutputMode  `json:"scopeOutputMode,omitempty"`
+	ClientToken          string                `json:"clientToken,omitempty"`
+	TriggerType          string                `json:"triggerType,omitempty"`
+	ExpandedScopeLimit   int                   `json:"expandedScopeLimit,omitempty"`
+	InputScopes          []Scope               `json:"inputScopes,omitempty"`
+	ExpandedScopes       []Scope               `json:"expandedScopes,omitempty"`
+	TargetScopes         []Scope               `json:"targetScopes,omitempty"`
+	MinTimestamp         int64                 `json:"minTimestamp,omitempty"`
+	MaxTimestamp         int64                 `json:"maxTimestamp,omitempty"`
+	MaxSessions          int                   `json:"maxSessions,omitempty"`
+	MaxMessages          int                   `json:"maxMessages,omitempty"`
+	MaxMemories          int                   `json:"maxMemories,omitempty"`
+	ConfidenceThresholds map[string]float64    `json:"confidenceThresholds,omitempty"`
+	Instructions         string                `json:"instructions,omitempty"`
+	Incremental          bool                  `json:"incremental,omitempty"`
 	// ProcessedThroughMs is the watermark incremental runs resume from.
 	ProcessedThroughMs int64          `json:"processedThroughMs,omitempty"`
 	SkippedByReason    map[string]int `json:"skippedByReason,omitempty"`
@@ -746,13 +808,15 @@ type DreamTask struct {
 
 // DreamTaskInputSummary summarizes the input window of a dream task.
 type DreamTaskInputSummary struct {
-	Scopes       []Scope `json:"scopes,omitempty"`
-	MinTimestamp int64   `json:"minTimestamp,omitempty"`
-	MaxTimestamp int64   `json:"maxTimestamp,omitempty"`
-	SessionCount int     `json:"sessionCount,omitempty"`
-	MessageCount int     `json:"messageCount,omitempty"`
-	MemoryCount  int     `json:"memoryCount,omitempty"`
-	Incremental  bool    `json:"incremental,omitempty"`
+	ExpandedScopes []Scope `json:"expandedScopes,omitempty"`
+	ItemCount      int     `json:"itemCount,omitempty"`
+	Scopes         []Scope `json:"scopes,omitempty"`
+	MinTimestamp   int64   `json:"minTimestamp,omitempty"`
+	MaxTimestamp   int64   `json:"maxTimestamp,omitempty"`
+	SessionCount   int     `json:"sessionCount,omitempty"`
+	MessageCount   int     `json:"messageCount,omitempty"`
+	MemoryCount    int     `json:"memoryCount,omitempty"`
+	Incremental    bool    `json:"incremental,omitempty"`
 }
 
 // DreamTaskActionStats aggregates action counts of a dream task.
@@ -776,6 +840,13 @@ type CreateMemoryDreamTaskResponse struct {
 
 // GetMemoryDreamTaskResponse is the response of GetMemoryDreamTask.
 type GetMemoryDreamTaskResponse struct {
+	Effort          DreamEffort           `json:"effort,omitempty"`
+	Stage           string                `json:"stage,omitempty"`
+	FailureCode     string                `json:"failureCode,omitempty"`
+	OutputScope     *Scope                `json:"outputScope,omitempty"`
+	MaxItems        int                   `json:"maxItems,omitempty"`
+	Plan            *DreamPlan            `json:"plan,omitempty"`
+	Diagnostic      *DreamDiagnostic      `json:"diagnostic,omitempty"`
 	MemoryStoreName string                `json:"memoryStoreName"`
 	DreamID         string                `json:"dreamId"`
 	TaskType        DreamTaskType         `json:"taskType,omitempty"`
@@ -827,10 +898,97 @@ type DreamApplyActionResult struct {
 
 // ApplyMemoryDreamActionsResponse is the response of ApplyMemoryDreamActions.
 type ApplyMemoryDreamActionsResponse struct {
-	MemoryStoreName string                   `json:"memoryStoreName"`
-	DreamID         string                   `json:"dreamId"`
-	Applied         int                      `json:"applied"`
-	Failed          int                      `json:"failed"`
-	NotFound        int                      `json:"notFound,omitempty"`
-	Results         []DreamApplyActionResult `json:"results"`
+	Status             DreamTaskStatus          `json:"status,omitempty"`
+	ApprovedAt         string                   `json:"approvedAt,omitempty"`
+	ExecutionExpiresAt string                   `json:"executionExpiresAt,omitempty"`
+	MemoryStoreName    string                   `json:"memoryStoreName"`
+	DreamID            string                   `json:"dreamId"`
+	Applied            int                      `json:"applied"`
+	Failed             int                      `json:"failed"`
+	NotFound           int                      `json:"notFound,omitempty"`
+	Results            []DreamApplyActionResult `json:"results"`
+}
+
+// MarshalJSON omits a zero Scope, allowing filter-only scope directory queries.
+func (r ListMemoryStoreScopesRequest) MarshalJSON() ([]byte, error) {
+	type plain ListMemoryStoreScopesRequest
+	var scope *Scope
+	if r.Scope != (Scope{}) {
+		scope = &r.Scope
+	}
+	return json.Marshal(struct {
+		plain
+		Scope *Scope `json:"scope,omitempty"`
+	}{plain: plain(r), Scope: scope})
+}
+
+// MarshalJSON permits an omitted scope for ID-based lookup on current servers.
+func (r GetMemoryRequest) MarshalJSON() ([]byte, error) {
+	type plain GetMemoryRequest
+	var scope *Scope
+	if r.Scope != (Scope{}) {
+		scope = &r.Scope
+	}
+	return json.Marshal(struct {
+		plain
+		Scope *Scope `json:"scope,omitempty"`
+	}{plain: plain(r), Scope: scope})
+}
+
+// MarshalJSON permits an omitted scope for ID-based lookup and preserves a
+// non-nil empty Metadata map as an explicit request to clear stored metadata.
+func (r UpdateMemoryRequest) MarshalJSON() ([]byte, error) {
+	type plain UpdateMemoryRequest
+	var scope *Scope
+	if r.Scope != (Scope{}) {
+		scope = &r.Scope
+	}
+	var metadata *map[string]string
+	if r.Metadata != nil {
+		metadata = &r.Metadata
+	}
+	return json.Marshal(struct {
+		plain
+		Scope    *Scope             `json:"scope,omitempty"`
+		Metadata *map[string]string `json:"metadata,omitempty"`
+	}{plain: plain(r), Scope: scope, Metadata: metadata})
+}
+
+// MarshalJSON permits an omitted scope for ID-based lookup on current servers.
+func (r DeleteMemoryRequest) MarshalJSON() ([]byte, error) {
+	type plain DeleteMemoryRequest
+	var scope *Scope
+	if r.Scope != (Scope{}) {
+		scope = &r.Scope
+	}
+	return json.Marshal(struct {
+		plain
+		Scope *Scope `json:"scope,omitempty"`
+	}{plain: plain(r), Scope: scope})
+}
+
+// MarshalJSON preserves an explicitly empty outputTypes list for server validation.
+func (r CreateMemoryStoreRequest) MarshalJSON() ([]byte, error) {
+	type plain CreateMemoryStoreRequest
+	var outputs *[]string
+	if r.OutputTypes != nil {
+		outputs = &r.OutputTypes
+	}
+	return json.Marshal(struct {
+		plain
+		OutputTypes *[]string `json:"outputTypes,omitempty"`
+	}{plain: plain(r), OutputTypes: outputs})
+}
+
+// MarshalJSON preserves an explicitly empty outputTypes list for server validation.
+func (r UpdateMemoryStoreRequest) MarshalJSON() ([]byte, error) {
+	type plain UpdateMemoryStoreRequest
+	var outputs *[]string
+	if r.OutputTypes != nil {
+		outputs = &r.OutputTypes
+	}
+	return json.Marshal(struct {
+		plain
+		OutputTypes *[]string `json:"outputTypes,omitempty"`
+	}{plain: plain(r), OutputTypes: outputs})
 }

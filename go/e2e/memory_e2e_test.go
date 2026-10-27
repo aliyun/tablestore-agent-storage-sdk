@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -21,6 +22,11 @@ import (
 )
 
 func e2eClient(t *testing.T) *agentstorage.Client {
+	t.Helper()
+	return e2eClientWithHTTPClient(t, nil)
+}
+
+func e2eClientWithHTTPClient(t *testing.T, httpClient *http.Client) *agentstorage.Client {
 	t.Helper()
 	endpoint := os.Getenv("OTS_ENDPOINT")
 	instance := os.Getenv("OTS_INSTANCE_NAME")
@@ -44,6 +50,7 @@ func e2eClient(t *testing.T) *agentstorage.Client {
 		Region:              os.Getenv("OTS_REGION"),
 		SignVersion:         agentstorage.SignVersion(os.Getenv("OTS_SIGN_VERSION")),
 		Timeout:             60 * time.Second,
+		HTTPClient:          httpClient,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -182,14 +189,13 @@ func TestMemoryE2E(t *testing.T) {
 	ctx := context.Background()
 	store := fmt.Sprintf("gomem_%d_%s", time.Now().Unix(), suffix(6))
 
-	defer func() {
-		_, _ = client.DeleteMemoryStore(ctx, &agentstorage.DeleteMemoryStoreRequest{MemoryStoreName: store})
-	}()
+	description := "Go SDK memory e2e: " + store
+	registerStoreCleanup(t, client, store, description, description+" updated")
 
 	// --- Memory store lifecycle ---
 	created, err := client.CreateMemoryStore(ctx, &agentstorage.CreateMemoryStoreRequest{
 		MemoryStoreName: store,
-		Description:     "Go SDK memory e2e",
+		Description:     description,
 	})
 	if err != nil {
 		t.Fatalf("CreateMemoryStore: %v", err)
@@ -203,7 +209,7 @@ func TestMemoryE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMemoryStore: %v", err)
 	}
-	if fetched.Description != "Go SDK memory e2e" {
+	if fetched.Description != description {
 		t.Errorf("GetMemoryStore description = %q", fetched.Description)
 	}
 
@@ -224,35 +230,18 @@ func TestMemoryE2E(t *testing.T) {
 
 	updatedStore, err := client.UpdateMemoryStore(ctx, &agentstorage.UpdateMemoryStoreRequest{
 		MemoryStoreName: store,
-		Description:     agentstorage.String("Go SDK memory e2e updated"),
+		Description:     agentstorage.String(description + " updated"),
 	})
 	if err != nil {
 		t.Fatalf("UpdateMemoryStore: %v", err)
 	}
-	if updatedStore.Description != "Go SDK memory e2e updated" {
+	if updatedStore.Description != description+" updated" {
 		t.Errorf("UpdateMemoryStore description = %q", updatedStore.Description)
 	}
 
-	// --- Warm up the fresh store (mirrors the TS e2e suite) ---
-	t.Log("warming up store (60s)...")
-	time.Sleep(60 * time.Second)
-	warmScope := fullScope("warm")
-	_, err = retry(t, 5, 2*time.Second, func() (*agentstorage.AddMemoriesResponse, error) {
-		return client.AddMemories(ctx, &agentstorage.AddMemoriesRequest{
-			MemoryStoreName: store,
-			Scope:           &warmScope,
-			Text:            "Go SDK warm sentinel memory for store readiness.",
-			Sync:            true,
-		})
-	}, func(err error) bool {
-		status, _ := serviceStatus(err)
-		return status == 500
-	})
-	if err != nil {
-		t.Fatalf("warm AddMemories: %v", err)
-	}
-	waitForListMatch(t, ctx, client, store, warmScope, "warm sentinel", "warm sentinel not list-visible")
-	waitForMemoryIDIndexReady(t, ctx, client, store, warmScope)
+	// --- Wait for the fresh store index without requiring LLM warm-up facts. ---
+	t.Log("waiting for store index readiness...")
+	waitForMemoryIDIndexReady(t, ctx, client, store, fullScope("readiness"))
 	t.Log("store warmed up")
 
 	// --- Conversation messages (short-term memory) ---
@@ -308,15 +297,16 @@ func TestMemoryE2E(t *testing.T) {
 	}
 
 	// --- Request audit records ---
-	requests, err := client.ListMemoryStoreRequests(ctx, &agentstorage.ListMemoryStoreRequestsRequest{
-		MemoryStoreName: store,
-		Scope:           &agentstorage.Scope{AppID: conversationScope.AppID},
-		Operation:       "AddMemories",
-		Limit:           20,
+	requests := poll(t, 120*time.Second, 2*time.Second, "exact ingest audit record visible", func() (*agentstorage.ListMemoryStoreRequestsResponse, error) {
+		return client.ListMemoryStoreRequests(ctx, &agentstorage.ListMemoryStoreRequestsRequest{MemoryStoreName: store, Scope: &conversationScope, Operation: "AddMemories", Limit: 20})
+	}, func(r *agentstorage.ListMemoryStoreRequestsResponse) bool {
+		for _, record := range r.Requests {
+			if record.RequestID == addMessages.RequestID {
+				return true
+			}
+		}
+		return false
 	})
-	if err != nil {
-		t.Fatalf("ListMemoryStoreRequests: %v", err)
-	}
 	if requests.MemoryStoreName != store {
 		t.Errorf("requests store = %q", requests.MemoryStoreName)
 	}
@@ -328,6 +318,9 @@ func TestMemoryE2E(t *testing.T) {
 	t.Logf("audit records: %d", len(requests.Requests))
 
 	// --- Async ingestion task APIs ---
+	if addMessages.RequestID == "" {
+		t.Fatal("AddMemories returned no request ID")
+	}
 	if addMessages.RequestID != "" {
 		task := poll(t, 120*time.Second, 3*time.Second, "ingest task not completed",
 			func() (*agentstorage.GetMemoryTaskResponse, error) {
@@ -351,17 +344,33 @@ func TestMemoryE2E(t *testing.T) {
 		}
 		t.Logf("ingest task: status=%s units=%d", task.Task.Status, len(task.Task.DerivedUnitIDs))
 
-		tasks, err := client.ListMemoryTasks(ctx, &agentstorage.ListMemoryTasksRequest{
-			MemoryStoreName: store,
-			Scope:           conversationScope,
-			Limit:           10,
+		poll(t, 120*time.Second, 2*time.Second, "exact completed ingest task visible in list", func() (*agentstorage.ListMemoryTasksResponse, error) {
+			combined := &agentstorage.ListMemoryTasksResponse{MemoryStoreName: store, Scope: conversationScope}
+			token := ""
+			seen := map[string]bool{}
+			for {
+				page, err := client.ListMemoryTasks(ctx, &agentstorage.ListMemoryTasksRequest{MemoryStoreName: store, Scope: conversationScope, Limit: 100, NextToken: token})
+				if err != nil {
+					return nil, err
+				}
+				combined.Tasks = append(combined.Tasks, page.Tasks...)
+				token = page.NextToken
+				if token == "" {
+					return combined, nil
+				}
+				if seen[token] {
+					return nil, fmt.Errorf("task list cursor repeated")
+				}
+				seen[token] = true
+			}
+		}, func(r *agentstorage.ListMemoryTasksResponse) bool {
+			for _, task := range r.Tasks {
+				if task.RequestID == addMessages.RequestID && task.Scope == conversationScope && task.Status == agentstorage.MemoryTaskStatusCompleted {
+					return true
+				}
+			}
+			return false
 		})
-		if err != nil {
-			t.Fatalf("ListMemoryTasks: %v", err)
-		}
-		if len(tasks.Tasks) == 0 {
-			t.Error("ListMemoryTasks returned no tasks")
-		}
 	}
 
 	// Scope listing is served from the async-synced search index, so poll.
@@ -497,14 +506,14 @@ func TestMemoryE2E(t *testing.T) {
 		},
 		func(gone bool) bool { return gone })
 
-	// --- Dream APIs (best-effort: depends on server-side LLM configuration) ---
+	// --- Dream API protocol checks; terminal semantic checks live in release_workflow_e2e_test.go. ---
 	dream, err := client.CreateMemoryDreamTask(ctx, &agentstorage.CreateMemoryDreamTaskRequest{
 		MemoryStoreName: store,
 		Scopes:          []agentstorage.Scope{{AppID: conversationScope.AppID, TenantID: conversationScope.TenantID}},
 		ApplyMode:       agentstorage.DreamApplyModeProposal,
 	})
 	if err != nil {
-		t.Logf("CreateMemoryDreamTask unavailable on this server, skipping dream checks: %v", err)
+		t.Fatalf("CreateMemoryDreamTask: %v", err)
 	} else {
 		t.Logf("dream task created: %s status=%s", dream.DreamID, dream.Status)
 		dreamTask, err := client.GetMemoryDreamTask(ctx, &agentstorage.GetMemoryDreamTaskRequest{

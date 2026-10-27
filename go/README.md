@@ -1,9 +1,11 @@
 # Tablestore Agent Storage SDK for Go
 
 Go SDK for Tablestore Agent Storage, covering the knowledge-base, document,
-chunk, retrieval, memory (store / long-term / short-term / task / dream) and
-file-memory APIs. Feature-aligned with the Python and TypeScript SDKs in
-this repository.
+chunk, retrieval, memory (store / long-term / short-term / task / dream),
+file-memory and Wiki APIs. Version **0.0.3** adds current Memory request fields,
+file search and history cleanup, and typed Wiki APIs.
+See [protocol coverage and validation](PROTOCOL.md) for the exact scope and
+live-test limitations.
 
 ## Install
 
@@ -40,6 +42,8 @@ func main() {
 	_, _ = client.CreateMemoryStore(ctx, &agentstorage.CreateMemoryStoreRequest{
 		MemoryStoreName: "agent_memory",
 		Description:     "Agent long-term memory",
+		InputType:       agentstorage.StoreInputMessages,
+		OutputTypes:     []string{agentstorage.StoreOutputStructured},
 	})
 	_, _ = client.AddMemories(ctx, &agentstorage.AddMemoriesRequest{
 		MemoryStoreName: "agent_memory",
@@ -176,37 +180,147 @@ rejects the whole request with `400 BAD_REQUEST`, and one with the V2 write
 path disabled answers `409 CONFLICT` to `UpdateMemory` calls carrying
 `Title` / `Keywords` / `EffectiveAt` / `TimePrecision`.
 
+## Store input and output types
+
+Create stores with `InputType` (`messages` or `file`) and `OutputTypes`
+(`structured`, `file`, or both). Send them together and omit the legacy
+`StorageMode`. The service validates supported combinations. `UpdateMemoryStore`
+can update output types and `WikiReflectionEnabled`; input type is immutable.
+Optional booleans use pointers, so `Bool(false)` is sent explicitly.
+Message-input stores that include file output require asynchronous
+`AddMemories` (`Sync: false`), including dual structured/file output.
+Synchronous `MemoryIDs` are available for structured-only stores.
+
+## Scope filters and search thresholds
+
+`ScopeFilter` is the Memory Scope Directory expression, distinct from the
+knowledge-base `MetadataFilter`. `ListMemoryStoreScopes`, `ListMemories`,
+`SearchMemories`, `ListItems` and `SearchItems` accept it. Current stores support
+`and`, `or`, `not`, `eq`, `in` and `exists`; the service applies historical
+`prefix`, `wildcard` and `range` support according to the store's creation-time
+contract. Pagination tokens must be replayed with the same scope/filter.
+
+```go
+filter := &agentstorage.ScopeFilter{
+    Op: "eq", Field: "appId", Value: agentstorage.String("app-001"),
+}
+scopes, err := client.ListMemoryStoreScopes(ctx, &agentstorage.ListMemoryStoreScopesRequest{
+    MemoryStoreName: "agent_memory", Filter: filter, // zero Scope is omitted
+})
+if err != nil { return }
+for _, entry := range scopes.ScopeEntries {
+    // Scopes remains the legacy four-field view; ScopeEntries preserves
+    // scopeType, scopeKey and all dynamic dimensions, including Wiki entries.
+    fmt.Println(entry.ScopeType, entry.ScopeKey, entry.Dimensions)
+}
+```
+
+Use `SearchMemoriesRequest.Thresholds` for independent `MinSimilarity` and
+`MinScore` bounds; both nonzero bounds must pass before session ranking.
+The legacy top-level `MinSimilarity` filters canonical score, and must not be
+combined with `Thresholds`. `GetMemory`, `UpdateMemory` and `DeleteMemory` can
+omit Scope for ID lookup on current servers. An explicitly empty Metadata map
+in `UpdateMemory` clears metadata; nil leaves it unchanged.
+Before 0.0.3, empty maps were omitted. When upgrading, use nil for conditionally
+built maps if an empty result should leave the stored metadata unchanged.
+
 ## Items (file memory)
 
-`filemem` memory stores keep versioned memory files; `file+ots` stores expose
-long-term memories as a read-only projected file tree. Both are accessed
-through the item APIs: `AddItem`, `ListItems`, `GetItem` (metadata only with
-`IncludeContent: agentstorage.Bool(false)`), `UpdateItem` (set exactly one of
-`Content` to rewrite or `NewPath` to rename), `DeleteItem`,
-`ListItemVersions`, `GetItemVersion` and `RedactItemVersion`. Every request
-carries `"type": "memoryfile"`, filled automatically when `Type` is empty:
+File-input stores accept file writes. Managed files produced by message-input
+stores are read-only. The SDK fills `type: "memoryfile"` when `Type` is empty.
+`GetItem` and single `DeleteItem` accept exactly one of `ItemID` or `Path`.
+`View: ItemViewFull` includes content; the default `ItemViewBasic` omits it.
+`ListItems` and `ListItemVersions` accept at most 100 entries per page, capped
+at 20 for the full view. `UpdateItem.Path` remains a `*string`: nil omits the
+rename target, while an explicit empty string is sent for server validation.
+`Overwrite` is meaningful only with a target path.
 
 ```go
 scoped := agentstorage.ItemScopedRequest{
-	MemoryStoreName: "agent_memory",
-	Scope:           agentstorage.Scope{AppID: "a", TenantID: "t", AgentID: "ag", RunID: "r"},
+    MemoryStoreName: "file_store",
+    Scope: agentstorage.Scope{AppID: "a", TenantID: "t", AgentID: "ag", RunID: "r"},
 }
 item, err := client.AddItem(ctx, &agentstorage.AddItemRequest{
-	ItemScopedRequest: scoped, Path: "/notes/a.md", Content: "hello",
+    ItemScopedRequest: scoped, Path: "/notes/a.md", Content: "hello",
 })
-_, err = client.UpdateItem(ctx, &agentstorage.UpdateItemRequest{
-	ItemScopedRequest: scoped, Path: "/notes/a.md",
-	Content:        agentstorage.String("updated"),
-	ExpectedSHA256: item.ContentSHA256, // optional compare-and-set guard
+if err != nil { return }
+updated, err := client.UpdateItem(ctx, &agentstorage.UpdateItemRequest{
+    ItemScopedRequest: scoped,
+    ItemID: item.ItemID,
+    Path: agentstorage.String("/notes/b.md"), // destination; may be combined with Content atomically
+    Content: agentstorage.String("updated"),
+    Precondition: &agentstorage.ItemPrecondition{ExpectedVersionID: item.LatestVersionID},
 })
-_, err = client.UpdateItem(ctx, &agentstorage.UpdateItemRequest{
-	ItemScopedRequest: scoped, Path: "/notes/a.md", NewPath: "/notes/b.md", // rename
-})
-listed, err := client.ListItems(ctx, &agentstorage.ListItemsRequest{
-	ItemScopedRequest: scoped, PathPrefix: "/notes/",
-})
-_ = listed // listed.ReadOnly is true for file+ots projections
+_ = updated
 ```
+
+Ordinary `AddItem` paths must end in `.md` and use text `Content`.
+Binary creation uses the Wiki raw namespace (`/.wiki/raw/...`) and requires
+the server binary capability. For those uploads, set `ContentBase64: String(base64.StdEncoding.EncodeToString(data))`
+and `MediaType`, and leave `Content` unset. Binary content is returned as
+`ContentBase64` on full item/version reads. Availability and size limits depend
+on the service configuration. `ListItems` omits binary content and summaries
+even in full view; use `GetItem` for binary content and file summaries.
+
+`SearchItems` requires `inputType=messages` with a `file` output; it does not
+search uploaded files or Wiki pages. It searches managed-file summaries with optional `Filter`, `TopK`
+and `Thresholds`, returning identity, summary, version and scores.
+`ListItemVersions` supports an `ItemID` or `Path` filter. `DeleteItemVersions`
+removes historical versions asynchronously in a wildcard scope after all current
+items in that scope are removed. `DeleteItem.DeleteVersions` applies only to
+ranged deletes; a pending task ID means acceptance, not completed deletion.
+
+Compatibility: `NewPath` remains a deprecated rename alias. An `UpdateItem`
+with Path but no ItemID resolves the old path through `GetItem` only when it
+explicitly uses `NewPath` or `ExpectedSHA256`. Otherwise a missing ItemID fails
+locally, so a malformed current request cannot write to the rename destination.
+`ExpectedSHA256` on update/delete checks the current hash and then sends a
+resource-version precondition, preserving protection across concurrent writes.
+A local hash mismatch returns `ClientError`; a subsequent server conflict is
+returned unchanged and is not retried. Raw `Do` callers must use the current
+wire fields directly. `ApiKeyID` version filtering was removed by the service
+and nonempty values now fail locally.
+
+## Wiki
+
+Wiki APIs use a three-part `AgentScope`; do not include runId. The methods are
+`GetWiki`, `UpdateWiki`, `IngestWiki`, `ListWikiPages`, `GetWikiPage` and
+`SearchWikiPages`.
+
+```go
+wikiScope := agentstorage.WikiScopedRequest{
+    MemoryStoreName: "file_store",
+    Scope: agentstorage.AgentScope{AppID: "a", TenantID: "t", AgentID: "ag"},
+}
+_, err = client.UpdateWiki(ctx, &agentstorage.UpdateWikiRequest{
+    WikiScopedRequest: wikiScope,
+    CompileOptions: agentstorage.NullableOf(agentstorage.WikiCompileOptions{
+        Language: "zh",
+        Incremental: &agentstorage.WikiIncrementalOptions{Enabled: true},
+    }),
+})
+```
+
+Omitted compile options stay unchanged; `Null[WikiCompileOptions]()` or an
+empty options object resets them. `LatestBuild` retains progress, partial
+publication, completed/planned pages, quality, attempt failures and diagnostics.
+`WikiPage.Reflection` and optional `InteractionRef` support feedback-aware reads.
+An accepted ingest or partial snapshot does not establish a completed build.
+
+## Dream and ingestion tasks
+
+`CreateMemoryDreamTask` supports `Effort`, file input `OutputScope`/`MaxItems`,
+and incremental processing. High-effort plan mode uses `DreamApplyModePlan` and
+can return `awaiting_plan_approval`; inspect `Plan.DeleteMemoryIDs` before an
+explicit `ApplyMemoryDreamActions` request with `Mode: DreamApplyRequestModePlan`
+and `Approver`. Creating or polling a task never approves its plan.
+
+Get and List Dream responses expose nested `Input` and `Actions`, stage,
+failure code, file outputs, plan and diagnostics. A `staged` action is a private
+candidate, not an applied result. List responses also populate the legacy
+flat count/scope fields. Ingestion tasks retain primary/last error
+stages and classes. Synchronous `AddMemories` exposes `MemoryIDs` when returned
+by the service.
 
 ## Raw requests
 
@@ -228,5 +342,39 @@ err := client.Do(ctx, "ListMemoryStores", map[string]any{"limit": 10}, &result)
 ## Test
 
 ```bash
-cd go && go test ./...
+cd go
+go test ./...
+go test -race ./...
+go vet ./...
 ```
+
+Live tests read `OTS_ENDPOINT`, `OTS_INSTANCE_NAME`, and
+`OTS_ACCESS_KEY_ID`/`OTS_ACCESS_KEY_SECRET` (or `OTS_API_KEY`) from the environment.
+Do not put credentials in source files. With those variables set:
+
+```bash
+go test ./e2e -run '^TestCurrent(File|Memory|StructuredMemory)ProtocolE2E$' -count=1 -v -timeout=15m
+```
+
+The current-protocol tests create uniquely named stores, verify state/content
+and delete/read back those stores. A missing environment skips live tests; an
+API or semantic failure fails them. Empty-scope Wiki checks cover protocol and
+configuration; they do not claim successful model-generated Wiki compilation.
+
+File-input structured extraction has its own live suites:
+
+```bash
+go test ./e2e -run '^TestFileStructured(Only)?ExtractionE2E$' -count=1 -v -timeout=15m
+```
+
+These verify conversion task identity, persisted/retrieved facts, retained-source
+update/rename/delete behavior, and structured-only source restrictions/path
+reuse. They do not prove physical source/version/artifact purge in
+structured-only mode; see [PROTOCOL.md](PROTOCOL.md) for the acceptance boundary.
+
+The formal release suites additionally cover ten binary formats and size limits,
+accepted-response loss, concurrent version guards, delete/redact cascades,
+multi-Scope file search, successful Wiki publication, and approved Dream plans.
+See [PROTOCOL.md](PROTOCOL.md) for coverage and known service limitations.
+The 1001-conversation boundary test
+requires `MEMORY_E2E_LARGE_SCOPE=1`; it is intentionally a separate live run.

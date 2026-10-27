@@ -1,7 +1,21 @@
 """Tablestore Agent Storage SDK for Python."""
 
-from tablestore_agent_storage.client import AgentStorageClient
+from tablestore_agent_storage.client import (
+    AgentStorageClient,
+    ITEM_TYPE_MEMORY_FILE,
+    ITEM_TYPE_MEMORY_FILE_PREFIX,
+    ITEM_VIEW_BASIC,
+    ITEM_VIEW_FULL,
+)
+from tablestore_agent_storage.errors import OTSError, OTSClientError, OTSServiceError
 from tablestore_agent_storage.models import (
+    # Item Request Models
+    ItemScope,
+    ItemPrecondition,
+    ItemScopedRequest,
+    GetItemRequest,
+    UpdateItemRequest,
+    DeleteItemRequest,
     # Enums
     MetadataFieldType,
     SearchType,
@@ -41,11 +55,40 @@ from tablestore_agent_storage.models import (
     RetrievalConfiguration,
     RetrieveRequest,
 )
+from tablestore_agent_storage.retry import (
+    RetryPolicy,
+    DefaultRetryPolicy,
+    NoRetryPolicy,
+    NoDelayRetryPolicy,
+    WriteRetryPolicy,
+)
 
-__version__ = "1.0.4"
+__version__ = "1.0.11"
 __all__ = [
     # Client
     "AgentStorageClient",
+    # Item constants
+    "ITEM_TYPE_MEMORY_FILE",
+    "ITEM_TYPE_MEMORY_FILE_PREFIX",
+    "ITEM_VIEW_BASIC",
+    "ITEM_VIEW_FULL",
+    # Item Request Models
+    "ItemScope",
+    "ItemPrecondition",
+    "ItemScopedRequest",
+    "GetItemRequest",
+    "UpdateItemRequest",
+    "DeleteItemRequest",
+    # Errors
+    "OTSError",
+    "OTSClientError",
+    "OTSServiceError",
+    # Retry policies
+    "RetryPolicy",
+    "DefaultRetryPolicy",
+    "NoRetryPolicy",
+    "NoDelayRetryPolicy",
+    "WriteRetryPolicy",
     # Enums
     "MetadataFieldType",
     "SearchType",
